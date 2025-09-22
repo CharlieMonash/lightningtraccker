@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Tas Lightning Alerts MVP</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <style>
+    html,body,#map { height:100%; margin:0; }
+    .panel {
+      position:absolute; top:10px; left:10px; background:#fff; padding:10px 12px;
+      border-radius:12px; font: 13px/1.3 system-ui; box-shadow:0 8px 24px rgba(0,0,0,.15);
+      max-width: 300px;
+    }
+    .banner {
+      position:absolute; top:10px; left:50%; transform: translateX(-50%);
+      background:#111; color:#fff; padding:8px 12px; border-radius:10px;
+      font:600 14px system-ui; box-shadow:0 6px 18px rgba(0,0,0,.2)
+    }
+    .warn { background:#f59e0b; color:#111; }
+    .danger { background:#ef4444; }
+    .row { margin:6px 0; }
+    .legend {
+      position:absolute; bottom:12px; left:12px; background:#fff; padding:8px 10px; border-radius:10px; font:12px system-ui; box-shadow:0 4px 16px rgba(0,0,0,.15)
+    }
+    .kv-legend {
+      position:absolute; bottom:12px; right:12px; background:#fff;
+      padding:8px 10px; border-radius:10px; font:12px system-ui;
+      box-shadow:0 4px 16px rgba(0,0,0,.15); line-height:1.4;
+    }
+    .kv-legend .row { display:flex; align-items:center; gap:6px; }
+    .kv-legend .sw { width:14px; height:10px; border-radius:2px; display:inline-block; }
+    .list { max-height:220px; overflow:auto; margin-top:6px; }
+    label { display:block; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="status" class="banner">Loading…</div>
+
+  <div class="panel">
+    <div class="row"><b>Lightning Alerts — Tasmania</b></div>
+    <div class="row">Next scan in: <span id="countdown">--:--</span> <button id="scanNow">Scan now</button></div>
+    <div class="row">
+      <label>Scan interval (min) <input id="interval" type="number" min="1" value="15" style="width:60px"></label>
+      <label>Alert radius (km) <input id="radius" type="number" min="1" value="50" style="width:60px"></label>
+      <label><input id="includeIC" type="checkbox"> Include intracloud (IC)</label>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="toggle-lines" checked> Transmission lines</label>
+      <label><input type="checkbox" id="toggle-stations" checked> Power stations</label>
+      <label><input type="checkbox" id="toggle-strikes" checked> Lightning strikes</label>
+      <label><input type="checkbox" id="toggle-circles" checked> 50 km circles</label>
+    </div>
+    <div class="row"><b>Stations with lightning &lt; radius</b></div>
+    <div id="alertList" class="list"></div>
+  </div>
+
+  <div class="legend">Layers: Lines / Stations / Lightning — Rings: 50 km</div>
+  <div class="kv-legend">
+    <div><b>Voltage (kV)</b></div>
+    <div class="row"><span class="sw" style="background:#8a8a8a"></span><span><110</span></div>
+    <div class="row"><span class="sw" style="background:#2e86de"></span><span>110</span></div>
+    <div class="row"><span class="sw" style="background:#1abc9c"></span><span>132</span></div>
+    <div class="row"><span class="sw" style="background:#f39c12"></span><span>220</span></div>
+    <div class="row"><span class="sw" style="background:#e67e22"></span><span>275</span></div>
+    <div class="row"><span class="sw" style="background:#e74c3c"></span><span>330+</span></div>
+  </div>
+
+  <audio id="beep">
+    <source src="data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABYAAAABAABERkZGRkZGRg==" type="audio/wav">
+  </audio>
+
+  <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+  <script>
+    const map = new maplibregl.Map({
+      container: 'map',
+      style: 'https://demotiles.maplibre.org/style.json',
+      center: [146.5, -42.0],
+      zoom: 6.2
+    });
+    map.addControl(new maplibregl.NavigationControl(), 'top-right');
+
+    const $status = document.getElementById('status');
+    const $countdown = document.getElementById('countdown');
+    const $scanNow = document.getElementById('scanNow');
+    const $interval = document.getElementById('interval');
+    const $radius = document.getElementById('radius');
+    const $includeIC = document.getElementById('includeIC');
+    const $toggleLines = document.getElementById('toggle-lines');
+    const $toggleStations = document.getElementById('toggle-stations');
+    const $toggleStrikes = document.getElementById('toggle-strikes');
+    const $toggleCircles = document.getElementById('toggle-circles');
+
+    let stations = [];
+    let nextScanAt = null;
+
+    function setBanner(level, text) {
+      $status.className = 'banner' + (level ? ' ' + level : '');
+      $status.textContent = text;
+    }
+
+    function upsertSource(id, data) {
+      if (map.getSource(id)) map.getSource(id).setData(data);
+      else map.addSource(id, { type: 'geojson', data });
+    }
+
+    function ensureLayer(id, def) {
+      if (!map.getLayer(id)) map.addLayer(def);
+    }
+
+    async function fetchStations() {
+      const r = await fetch('/api/stations');
+      const j = await r.json();
+      stations = j.stations || [];
+      const features = stations.map(s => ({
+        type:'Feature', geometry:{ type:'Point', coordinates:[s.lon, s.lat] }, properties:{ name: s.name }
+      }));
+      upsertSource('stations', { type:'FeatureCollection', features });
+      ensureLayer('stations', { id:'stations', type:'circle', source:'stations',
+        paint:{ 'circle-radius': 4, 'circle-color':'#1e40af', 'circle-stroke-color':'#fff', 'circle-stroke-width':1 }
+      });
+      if (!window._stationsHoverBound) {
+        window._stationsHoverBound = true;
+        const stPopup = new maplibregl.Popup({ closeButton:false, closeOnClick:false });
+        map.on('mouseenter', 'stations', () => { map.getCanvas().style.cursor = 'pointer'; });
+        map.on('mouseleave', 'stations', () => { map.getCanvas().style.cursor = ''; stPopup.remove(); });
+        map.on('mousemove', 'stations', (e) => {
+          const f = e.features && e.features[0];
+          if (!f) return;
+          const name = f.properties && f.properties.name ? f.properties.name : 'Power Station';
+          stPopup.setLngLat(e.lngLat)
+            .setHTML(`<div style="font:12px system-ui"><b>${name}</b></div>`)
+            .addTo(map);
+        });
+      }
+      const circles = stations.map(s => turf.circle([s.lon, s.lat], 50, {units:'kilometers', steps:128}));
+      upsertSource('station-rings', { type:'FeatureCollection', features: circles });
+      ensureLayer('station-rings', { id:'station-rings', type:'line', source:'station-rings',
+        paint:{ 'line-color':'#000', 'line-width':1, 'line-opacity':0.5 }
+      });
+    }
+
+    async function fetchLines() {
+      const b = map.getBounds();
+      const url = `/api/lines?xmin=${b.getWest()}&ymin=${b.getSouth()}&xmax=${b.getEast()}&ymax=${b.getNorth()}`;
+      const r = await fetch(url);
+      if (!r.ok) throw new Error('Failed lines ' + r.status);
+      const gj = await r.json();
+      upsertSource('ga-lines', gj);
+      if (!map.getLayer('ga-lines')) {
+        const kvExpr = [
+          'to-number',
+          ['coalesce', ['get','capacitykv'], ['get','CAPACITYKV'], ['get','voltagekv'], ['get','VOLTAGEKV'], 0]
+        ];
+        map.addLayer({
+          id:'ga-lines', type:'line', source:'ga-lines',
+          layout: { 'line-join':'round', 'line-cap':'round' },
+          paint:{
+            'line-color': [
+              'step', kvExpr,
+              '#8a8a8a',     // <110 kV
+              110, '#2e86de', // 110
+              132, '#1abc9c', // 132
+              220, '#f39c12', // 220
+              275, '#e67e22', // 275
+              330, '#e74c3c'  // 330+
+            ],
+            'line-width': [
+              'step', kvExpr,
+              2.0,
+              110, 2.4,
+              132, 2.8,
+              220, 3.4,
+              275, 3.8,
+              330, 4.2
+            ],
+            'line-opacity': 0.95
+          }
+        });
+        if (!window._gaLinesHoverBound) {
+          window._gaLinesHoverBound = true;
+          const linePopup = new maplibregl.Popup({ closeButton:false, closeOnClick:false });
+          map.on('mouseenter', 'ga-lines', () => { map.getCanvas().style.cursor = 'pointer'; });
+          map.on('mouseleave', 'ga-lines', () => { map.getCanvas().style.cursor = ''; linePopup.remove(); });
+          map.on('mousemove', 'ga-lines', (e) => {
+            const f = e.features && e.features[0];
+            if (!f) return;
+            const p = f.properties || {};
+            const name = p.name || p.NAME || p.TRANSMISSIONLINE_NAME || p.FEATURETYPE || 'Transmission Line';
+            const kv = p.capacitykv || p.CAPACITYKV || p.voltagekv || p.VOLTAGEKV || 'n/a';
+            linePopup.setLngLat(e.lngLat)
+              .setHTML(`<div style="font:12px system-ui"><b>${name}</b><br/>Voltage: ${kv}</div>`)
+              .addTo(map);
+          });
+          // Click to pin + log properties for debugging
+          map.on('click', 'ga-lines', (e) => {
+            const f = e.features && e.features[0];
+            if (!f) return;
+            console.log('Line properties:', f.properties);
+            const p = f.properties || {};
+            const name = p.name || p.NAME || p.TRANSMISSIONLINE_NAME || p.FEATURETYPE || 'Transmission Line';
+            const kv = p.capacitykv || p.CAPACITYKV || p.voltagekv || p.VOLTAGEKV || 'n/a';
+            new maplibregl.Popup({ closeButton:true }).setLngLat(e.lngLat)
+              .setHTML(`<div style="font:12px system-ui"><b>${name}</b><br/>Voltage: ${kv}</div>`)
+              .addTo(map);
+          });
+        }
+      }
+    }
+
+    async function scanOnce() {
+      try {
+        setBanner('', 'Scanning…');
+        const mins = Number($interval.value || 15);
+        const rad = Number($radius.value || 50);
+        const inc = $includeIC.checked ? 'true' : 'false';
+        const r = await fetch(`/api/scan?minutes=${mins}&radiusKm=${rad}&includeIC=${inc}`);
+        const j = await r.json();
+
+        const features = (j.points || []).map(p => ({
+          type:'Feature', geometry:{ type:'Point', coordinates:[p.lon, p.lat] },
+          properties: { dateTime: p.dateTime, type: p.type, amp: p.amp }
+        }));
+        upsertSource('strikes', { type:'FeatureCollection', features });
+        ensureLayer('strikes', { id:'strikes', type:'circle', source:'strikes',
+          paint:{ 'circle-radius': 4, 'circle-color':'#f59e0b', 'circle-stroke-color':'#111', 'circle-stroke-width':1 }
+        });
+
+        const list = document.getElementById('alertList');
+        list.innerHTML = '';
+        const affected = (j.results || []).filter(r => r.nearestKm !== null && r.nearestKm <= Number($radius.value || 50))
+                                           .sort((a,b) => a.nearestKm - b.nearestKm);
+        if (affected.length === 0) {
+          list.innerHTML = '<div>No stations within radius.</div>';
+          setBanner('', `Last scan OK — ${new Date(j.updatedAt).toLocaleTimeString('en-AU', { hour12:false, timeZone: 'Australia/Melbourne' })}`);
+        } else {
+          affected.forEach(a => {
+            const div = document.createElement('div');
+            div.textContent = `${a.station} — ${a.nearestKm.toFixed(1)} km`;
+            list.appendChild(div);
+          });
+          try { document.getElementById('beep').play(); } catch {}
+          const minKm = affected[0].nearestKm;
+          const level = (minKm < 10) ? 'danger' : 'warn';
+          setBanner(level, `Alerts: ${affected.length} station(s) within ${$radius.value} km`);
+        }
+
+        nextScanAt = Date.now() + Number($interval.value || 15)*60*1000;
+      } catch (e) {
+        console.warn(e);
+        setBanner('', 'Scan failed — will retry.');
+        nextScanAt = Date.now() + Number($interval.value || 15)*60*1000;
+      }
+    }
+
+    function tick() {
+      if (!nextScanAt) return;
+      const ms = nextScanAt - Date.now();
+      if (ms <= 0) { scanOnce(); return; }
+      const mm = Math.floor(ms/60000);
+      const ss = Math.floor((ms%60000)/1000);
+      $countdown.textContent = `${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`;
+    }
+
+    function applyToggles() {
+      const sets = [
+        ['ga-lines', $toggleLines.checked],
+        ['stations', $toggleStations.checked],
+        ['station-rings', $toggleCircles.checked],
+        ['strikes', $toggleStrikes.checked]
+      ];
+      sets.forEach(([id, vis]) => {
+        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', vis ? 'visible' : 'none');
+      });
+    }
+
+    map.on('load', async () => {
+      await fetchStations();
+      await fetchLines();
+      applyToggles();
+      scanOnce();
+      nextScanAt = Date.now() + Number($interval.value || 15)*60*1000;
+
+      let lt;
+      map.on('moveend', () => { clearTimeout(lt); lt = setTimeout(fetchLines, 300); });
+      setInterval(tick, 500);
+    });
+
+    $scanNow.addEventListener('click', () => { scanOnce(); });
+    [$interval, $radius, $includeIC, $toggleLines, $toggleStations, $toggleStrikes, $toggleCircles]
+      .forEach(el => el.addEventListener('change', applyToggles));
+  </script>
+</body>
+</html>
